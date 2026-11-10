@@ -2571,7 +2571,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // the experts selected by mm_ids, up to the down projection, from the MoE cache if cached
     // ids are the selected experts, for the biases and scales
     // fork: f16 expert activations at prefill (LLAMA_MOE_F16), off where upstream rescales the down input (amax, f32 only)
-    const bool moe_f16 = llm_graph_moe_f16(n_tokens, down_exps, exl3) &&
+    // and only for SILU-gated experts: other activations (SITU: kimi-k3) use ops without f16 kernels on the CPU
+    const bool moe_f16 = llm_graph_moe_f16(n_tokens, down_exps, exl3) && type_op == LLM_FFN_SILU &&
         !(arch == LLM_ARCH_MISTRAL4 || arch == LLM_ARCH_MELLUM || arch == LLM_ARCH_FLINT || arch == LLM_ARCH_LAGUNA);
 
     auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached) {

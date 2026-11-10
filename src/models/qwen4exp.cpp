@@ -229,17 +229,21 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     if (hparams.ple_n_heads > 0) {
         const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
         const auto * ple_w = ml.get_weight(ple_name.c_str());
-        if (ple_w != nullptr) {
+        // a model synthesised from metadata (test-llama-archs) has neither the single table nor the per-head split:
+        // it gets the single table sized by the head ranges, as upstream does
+        const bool ple_split = ple_w == nullptr &&
+            ml.get_weight(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "h0.weight").str().c_str()) != nullptr;
+        if (!ple_split) {
             // the head ranges are what the gather indexes, so they set the minimum row count
             int64_t ple_rows_min = 0;
             for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
                 ple_rows_min = std::max(ple_rows_min, (int64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h]);
             }
-            if (ple_w->tensor->ne[1] < ple_rows_min) {
+            if (ple_w != nullptr && ple_w->tensor->ne[1] < ple_rows_min) {
                 throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the PLE head ranges (%" PRId64 ")",
                                                 ple_name.c_str(), ple_w->tensor->ne[1], ple_rows_min));
             }
-            const int64_t ple_rows = ple_w->tensor->ne[1];
+            const int64_t ple_rows = ple_w != nullptr ? ple_w->tensor->ne[1] : ple_rows_min;
             // the PLE/engram table is gathered 16 random rows per token and never read densely, so
             // it wants MADV_RANDOM and no eager pull-in. See --tensor-read-lazy.
             per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
