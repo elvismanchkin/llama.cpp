@@ -1616,6 +1616,11 @@ struct vk_op_count_experts_push_constants {
     uint32_t args_off;   // GGML_VK_MMID_INDIRECT_EARLY: where to fold the matmul's dispatch args (0 = off)
     uint32_t gx;
     uint32_t bn;
+    // -1 ids (upstream #26631): zero the dst rows of the skipped slots (ne0_dst 0 = off), strides in dst elements
+    uint32_t ne0_dst;
+    uint32_t stride_dst;
+    uint32_t batch_stride_dst;
+    uint32_t dst_f16;
 };
 
 struct vk_op_mmid_row_lists_push_constants {
@@ -7337,7 +7342,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_count_equal_i32, "count_equal_i32", count_equal_i32_len, count_equal_i32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, { device->subgroup_size }, 1);
 
-    ggml_vk_create_pipeline(device, device->pipeline_count_experts, "count_experts", count_experts_len, count_experts_data, "main", 2, sizeof(vk_op_count_experts_push_constants), {1, 1, 1}, {}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_count_experts, "count_experts", count_experts_len, count_experts_data, "main", 3, sizeof(vk_op_count_experts_push_constants), {1, 1, 1}, {}, 1, true);
 
     ggml_vk_create_pipeline(device, device->pipeline_mmid_row_lists, "mmid_row_lists", mmid_row_lists_len, mmid_row_lists_data, "main", 2, sizeof(vk_op_mmid_row_lists_push_constants), {1, 1, 1}, {}, 1, true);
 
@@ -12901,6 +12906,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         ggml_vk_sync_buffers(ctx, subctx);
     }
     {
+        // this also zeroes the out_dst rows of the skipped slots (negative ids, upstream #26631): the matmul writes
+        // only the rows an expert owns
         const std::vector<uint32_t> pc = { (uint32_t)nei0,
                                            (uint32_t)nei1,
                                            (uint32_t)(nbi0 / ggml_type_size(ids->type)),
@@ -12908,9 +12915,13 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                            (uint32_t)(get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)),
                                            use_ind_early ? args_off : 0u,
                                            mmid_gx,
-                                           pipeline->wg_denoms[1] };
+                                           pipeline->wg_denoms[1],
+                                           (uint32_t)out_dst->ne[0],
+                                           (uint32_t)(out_dst->nb[1] / ggml_type_size(out_dst->type)),
+                                           (uint32_t)(out_dst->nb[2] / ggml_type_size(out_dst->type)),
+                                           d16 ? 1u : 0u };
         ggml_vk_dispatch_pipeline(ctx, subctx, count_experts,
-            { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf }, pc, { (uint32_t)n_as, 1, 1});
+            { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf, vk_subbuffer{ d_D, d_buf_offset, d_sz } }, pc, { (uint32_t)n_as, 1, 1});
     }
 
     if (x_non_contig) {
