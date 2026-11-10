@@ -19,8 +19,8 @@ void llama_model_motif3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,   hparams.n_moe_layer_step, false);
 
     if (hparams.n_expert > 0) {
-        ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp);
-        hparams.n_ff_shexp = hparams.n_ff_exp;
+        ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
+        hparams.n_ff_shexp = hparams.n_ff_exp();
         ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
         ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,       hparams.n_expert_shared);
         ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,      hparams.expert_weights_scale, false);
@@ -120,7 +120,7 @@ void llama_model_motif3::load_arch_tensors(llama_model_loader &) {
     const int64_t n_noise  = hparams.motif_n_noise_heads;
     const int64_t n_signal = n_head - n_noise;
 
-    const int64_t n_ff_exp   = hparams.n_ff_exp;
+    const int64_t n_ff_exp   = hparams.n_ff_exp();
     const int64_t n_ff_shexp = hparams.n_ff_shexp;
     const int64_t n_expert_shared = hparams.n_expert_shared;
 
@@ -541,17 +541,17 @@ ggml_tensor * llama_model_motif3::graph::build_moe_polynorm(const llama_model & 
     ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
 
     GGML_ASSERT(n_expert_used > 0);
-    for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
+    for (uint32_t i = 0; i < hparams.n_expert_used(); ++i) {
         cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd_, nt, experts->nb[2], i*experts->nb[1]);
         ggml_build_forward_expand(gf, cur_experts[i]);
     }
 
     ggml_tensor * moe_out = cur_experts[0];
-    for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
+    for (uint32_t i = 1; i < hparams.n_expert_used(); ++i) {
         moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
         ggml_build_forward_expand(gf, moe_out);
     }
-    if (hparams.n_expert_used == 1) {
+    if (hparams.n_expert_used() == 1) {
         moe_out = ggml_cont(ctx0, moe_out);
     }
     cb(moe_out, "ffn_moe_out", il);

@@ -25,6 +25,7 @@ layout(push_constant) uniform Parameters {
     uint  gate;           // HC_POST_GATE fusion: post = gate_out * sigmoid(gate_in * p) (qwen4exp scatter weights)
     float gate_in;
     float gate_out;
+    uint  has_comb;       // strix-port (upstream #28988): 0 = identity mixing, comb unbound (aliased to x)
 } p;
 
 void main() {
@@ -43,9 +44,13 @@ void main() {
         pw = (1.0f / (1.0f + exp(-(pw * p.gate_in)))) * p.gate_out;
     }
     float sum = data_x[i0 * p.sx0 + it * p.sx1] * pw;
-    for (uint isrc = 0; isrc < p.hc; ++isrc) {
-        sum += data_r[i0 * p.sr0 + isrc * p.sr1 + it * p.sr2]
-             * data_c[idst * p.sc0 + isrc * p.sc1 + it * p.sc2];
+    if (p.has_comb != 0) {
+        for (uint isrc = 0; isrc < p.hc; ++isrc) {
+            sum += data_r[i0 * p.sr0 + isrc * p.sr1 + it * p.sr2]
+                 * data_c[idst * p.sc0 + isrc * p.sc1 + it * p.sc2];
+        }
+    } else {
+        sum += data_r[i0 * p.sr0 + idst * p.sr1 + it * p.sr2];
     }
 
     data_d[i0 * p.sd0 + idst * p.sd1 + it * p.sd2] = sum;

@@ -2,6 +2,8 @@
 
 #include "llama-memory-hybrid.h"
 
+#include <array>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -9,21 +11,19 @@
 // llama_memory_hybrid_idx
 //
 
-// llama_memory_hybrid plus a third cache that holds one indexer key per token, for hybrid
-// architectures with block-sparse attention layers (qwen4exp QSA).
-// The indexer cache is a side buffer addressed by the cells of the attention cache: same
-// size, padding, stream count and slots, so cell j is the same token in both.
+// llama_memory_hybrid plus a third cache with one indexer key per token, for block-sparse attention (qwen4exp QSA)
+// the indexer is a side buffer over the attention cells: same size, padding, streams and slots, so cell j is one token in both
 
 class llama_memory_hybrid_idx : public llama_memory_hybrid {
 public:
     llama_memory_hybrid_idx(
         const llama_model & model,
+                     bool   no_alloc,
                             /* attn */
                 ggml_type   type_k,
                 ggml_type   type_v,
                      bool   v_trans,
                  uint32_t   kv_size,
-                 uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
                             /* recurrent */
@@ -41,7 +41,8 @@ public:
                             /* the indexer cache exists only if this is given */
     const layer_filter_cb & filter_idx);
 
-    ~llama_memory_hybrid_idx() = default;
+    // Defined out of line because kpool_layout is incomplete here.
+    ~llama_memory_hybrid_idx();
 
     //
     // llama_memory_i
@@ -77,55 +78,38 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
-    // QSA pooled-key cache: one row per block, holding the mean-pooled, RMS-normalised and
-    // rotated indexer key that build_qsa_top_k scores against. A block that is full never
-    // changes again -- its cells are written once and pooling, normalisation and rotation are
-    // all position-determined -- so only the tail of the cache is recomputed per ubatch.
-    // Anything that moves cells (a shift, a removal, a copy, a state load) drops the lot.
-    llama_kv_cache * get_mem_pool() const;  // nullptr when the model carries no indexer
+    // The model's indexer pool size.
+    uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
 
-    // how many trailing blocks the next graph must recompute. n_blocks while the cache is
-    // invalid, otherwise the tail this ubatch can touch: the blocks its own tokens land in,
-    // plus the blocks n_kv gains when it next grows by a padding step.
-    uint32_t qsa_pool_n_recomp(uint32_t ratio, uint32_t n_tokens, uint32_t n_kv, uint32_t n_pad_kv) const;
+    // Whether pools are kpool consecutive cells in sequence order (qwen4exp) instead of kpool consecutive positions.
+    bool get_kpool_by_order() const { return hparams_idx.indexer_kpool_by_order; }
 
-    // Blocks are cut on the position line, so what a cache-disturbing operation costs is a
-    // watermark, not a flag: everything below the first position it touches is still right.
-    // Speculative decoding drops its rejected tail with seq_rm on every single step, and
-    // treating that as "forget everything" made the cache recompute the whole table each time.
-    void qsa_pool_invalidate() const;                    // forget the lot
-    void qsa_pool_invalidate_from(llama_pos p0) const;   // forget positions >= p0
-    void qsa_pool_validate(uint32_t n_pos) const;        // positions < n_pos are now pooled
+    // Which cells of a sequence make up which pool of kpool consecutive positions (or cells, in order mode).
+    // It is kept here because it outlives the batch: pools are fixed by the positions relative to the
+    // sequence's first one, so a ubatch only ever appends to it. Sequence edits drop it, see mem_idx_stale.
+    struct kpool_layout;
 
-    // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
-    // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
-    //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
-    //   blk_cells I32 [ratio*n_blocks, ns] cells making up each block
-    //   blk_pos   I32 [4*n_blocks*ns]      mrope position rows of each block's first token
-    //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
-    // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
-    // the caller then adds the attention mask, the only part of the bias that varies within a block
-    // pool_* are null when the caller wants every block recomputed inline (the pre-cache path):
-    //   pool_idxs  I64 [n_recomp]        rows of the pooled cache this ubatch rewrites
-    //   pool_cells I32 [ratio*n_recomp]  cells making up each rewritten block
-    //   pool_pos   I32 [4*n_recomp]      mrope position rows of each rewritten block
-    // tail_idxs is non-null only for complete-block selection (maskless, selected-key attention):
-    //   tail_idxs  I32 [ratio-1, n_tokens/ns, ns] cells of the query's own partial block whose
-    //              position is <= the query's, -1 padded. The own block and the spare block are
-    //              then -inf in the per-block bias: their cells come from the tail, not the score.
-    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, ggml_tensor * pool_idxs, ggml_tensor * pool_cells,
-                       ggml_tensor * pool_pos, ggml_tensor * tail_idxs, const llama_ubatch * ubatch,
-                       uint32_t ratio, bool blk_bias, int64_t n_kv_ctx, int64_t n_ns_ctx) const;
+    const kpool_layout & kpool_layout_update();
+    const kpool_layout & kpool_layout_get() const;
 
-    // every QSA layer runs on a device whose flash attention reads a selected-key list without a
-    // mask (probed with supports_op), or LLAMA_QSA_SELECTED_KEY=0/1 forced the answer
-    bool qsa_selected_key_attn() const { return selected_key_attn; }
+    // The pooled keys persist in the idx cache across batches. A sequence edit can regroup the pools
+    // from some position on, which stales every pooled key at or after it. POS_CLEAN means none.
+    using stale_pos_t = std::array<llama_pos, LLAMA_MAX_SEQ>;
+
+    static constexpr llama_pos POS_CLEAN = std::numeric_limits<llama_pos>::max();
+
+    static stale_pos_t stale_pos_clean() {
+        stale_pos_t res;
+        res.fill(POS_CLEAN);
+        return res;
+    }
+
+    const stale_pos_t & mem_idx_stale_get() const { return mem_idx_stale; }
+    void mem_idx_stale_clear() { mem_idx_stale.fill(POS_CLEAN); }
 
 private:
-    // forget seq_id (or, for seq_id < 0, everything) in every cache at once, so that a restore
-    // that failed partway cannot leave the indexer cache holding cells the attention cache does
-    // not. seq_id < 0 drops the whole context, as the caches themselves do on a failed restore.
+    // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
+    // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
 
     // the indexer cache holds one key head per layer, so it needs its own hparams:
@@ -134,26 +118,36 @@ private:
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
 
-    // the pooled-key cache is addressed by block, so it needs its own hparams too
-    llama_hparams hparams_pool;
+    // unique_ptr because kpool_layout is incomplete here
+    std::unique_ptr<kpool_layout> kpool_lay;
 
-    const std::unique_ptr<llama_kv_cache> mem_pool;
+    // seq_id < 0 stales every sequence, p0 < 0 stales the sequence from its first position
+    void mem_idx_stale_set(llama_seq_id seq_id, llama_pos p0);
 
-    // pooled keys are correct for the blocks that cover positions below this
-    mutable uint32_t pool_valid_pos = 0;
+    // the position an edit at p0 stales the sequence from
+    llama_pos mem_idx_stale_pos(llama_seq_id seq_id, llama_pos p0) const;
 
-    // the pooled rows are addressed by block index, and set_input_qsa numbers blocks
-    // bucket-major across the sequence groups of a stream. With two sequences in one
-    // (unified) stream a block gained by either shifts every later index, and the shorter
-    // sequence's tail blocks sit mid-table where the recompute window cannot reach them.
-    // So the cache is only trusted while a single sequence is present in the stream.
-    bool qsa_pool_one_seq() const;
-
-    bool selected_key_attn = false;
+    stale_pos_t mem_idx_stale = stale_pos_clean();
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
 public:
+    class kpool_access {
+    public:
+        ggml_tensor * gather_key_gate(ggml_tensor * idxs) const;
+        ggml_tensor * scatter_pooled(ggml_tensor * values, ggml_tensor * idxs) const;
+        ggml_tensor * gather_pooled(ggml_tensor * idxs) const;
+
+    private:
+        friend class llama_memory_hybrid_idx_context;
+
+        kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd);
+
+        ggml_context * ctx;
+        ggml_tensor  * key_gate;
+        ggml_tensor  * pooled;
+    };
+
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
 
     // used for errors
@@ -175,7 +169,7 @@ public:
                     slot_info_vec_t   sinfos_idx,
           std::vector<llama_ubatch>   ubatches);
 
-    ~llama_memory_hybrid_idx_context() = default;
+    ~llama_memory_hybrid_idx_context(); // Defined out of line because kpool_state is incomplete here.
 
     //
     // llama_memory_context_i
@@ -191,38 +185,51 @@ public:
     // nullptr with no indexer
     const llama_kv_cache_context * get_idx() const;
 
-    // the QSA pooled-key cache, and how many trailing blocks the graph must rewrite into it
-    llama_kv_cache * get_mem_pool() const;
-    uint32_t qsa_pool_n_recomp(uint32_t ratio, uint32_t n_tokens, uint32_t n_kv, uint32_t n_pad_kv) const;
-
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
 
-    // pool_* are null when the caller wants every block recomputed inline (the pre-cache path):
-    //   pool_idxs  I64 [n_recomp]        rows of the pooled cache this ubatch rewrites
-    //   pool_cells I32 [ratio*n_recomp]  cells making up each rewritten block
-    //   pool_pos   I32 [4*n_recomp]      mrope position rows of each rewritten block
-    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, ggml_tensor * pool_idxs, ggml_tensor * pool_cells,
-                       ggml_tensor * pool_pos, ggml_tensor * tail_idxs, const llama_ubatch * ubatch,
-                       uint32_t ratio, bool blk_bias) const;
-
-    bool qsa_selected_key_attn() const { return mem != nullptr && mem->qsa_selected_key_attn(); }
-
-    // single stream, one-axis positions below 2^24, and no block split across sequence sets
-    // (qsa_scalar_visibility_cells): the visibility complete-block selection encodes is exact
-    bool qsa_scalar_visibility(const llama_ubatch & ubatch, uint32_t ratio) const;
+    // glm5-next and qwen4exp, complete pools of kpool cells per sequence, scored as whole pools.
+    uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.
+    uint32_t get_n_kpool_new() const; // Pools to re-pool this ubatch, padded to a stable bound, never below 1.
+    kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
+    // sel_mask (F32 [n_sel, 1, 1, n_tokens], can be null): 0 for the live selection slots, -inf for the dead ones
+    // new_pool_pos (I32 [4*n_new]): M-RoPE position of each new pool's first member, for pooled keys rotated at pooling time
+    void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
+                         ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
+                         const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr) const;
 
 private:
-    const llama_memory_hybrid_idx * mem = nullptr;
+    llama_memory_hybrid_idx * mem = nullptr;
 
     // streams per ubatch, read from the slot infos before ctx_idx takes them
     // declared first, so it is initialised while sinfos_idx is still intact
     const std::vector<uint32_t> ns_ubatch;
+
+    // the indexer cells of each ubatch, kept for pools in cache order (qwen4exp): token s*n + i of ubatch u
+    // sits in cell idxs[s][i] of stream strm[s] of sinfos_kpool[u], and several cells can share a position
+    const slot_info_vec_t sinfos_kpool;
 
     // null unless the model has an indexer
     const llama_memory_context_ptr ctx_idx;
 
     // mirrors the base class's ubatch cursor, which is private there
     size_t i_cur = 0;
+
+    // Which pools of the layout this ubatch must re-pool. The layout itself belongs to the memory.
+    struct kpool_state;
+    kpool_state kpool_build_sizes() const;
+    void kpool_build_state(const llama_ubatch & ubatch);
+    const kpool_state & kpool_cur() const;
+
+    // unique_ptr because kpool_state is incomplete here.
+    std::unique_ptr<kpool_state> kpool_st;
+
+    // The ubatch kpool_st was built for, guards against reads before apply.
+    size_t i_kpool = SIZE_MAX;
+
+    // Whether this context tracks k-pool states.
+    bool kpool_track() const;
+
+    // Positions each sequence must re-pool from, cleared only after the first ubatch succeeds
+    llama_memory_hybrid_idx::stale_pos_t mem_idx_stale_batch = llama_memory_hybrid_idx::stale_pos_clean();
 };

@@ -4,8 +4,8 @@ import { isLikelyTextFile, readFileAsText } from './text-files';
 import { isWebpMimeType, webpBase64UrlToPngDataURL } from './webp-to-png';
 import { SETTINGS_KEYS } from '$lib/constants';
 import { AttachmentType, FileTypeCategory, SpecialFileType } from '$lib/enums';
-import { modelsStore } from '$lib/stores/models.svelte';
-import { settingsStore } from '$lib/stores/settings.svelte';
+import { modelsStore } from '$lib/stores/models/index.svelte';
+import { settingsStore } from '$lib/stores/settings/index.svelte';
 import type { ChatUploadedFile, DatabaseMessageExtra, FileProcessingResult } from '$lib/types';
 import { getFileTypeCategory } from '$lib/utils';
 import { toast } from 'svelte-sonner';
@@ -112,7 +112,7 @@ export async function parseFilesToMessageExtras(
 				const currentConfig = settingsStore.config;
 				// Use per-model vision check for router mode
 				const hasVisionSupport = activeModelId
-					? modelsStore.modelSupportsVision(activeModelId)
+					? modelsStore.props.modelSupportsVision(activeModelId)
 					: false;
 
 				// Force PDF-to-text for non-vision models
@@ -140,6 +140,8 @@ export async function parseFilesToMessageExtras(
 					// Process PDF as images (only for vision models)
 					try {
 						const images = await convertPDFToImage(file.file);
+						// kept for the preview's Text view; the model only receives the images
+						const content = file.textContent ?? (await convertPDFToText(file.file).catch(() => ''));
 
 						// Show success toast for PDF image processing
 						toast.success(
@@ -151,7 +153,7 @@ export async function parseFilesToMessageExtras(
 
 						extras.push({
 							base64Data: base64Data,
-							content: `PDF file with ${images.length} pages`,
+							content,
 							images: images,
 							name: file.name,
 							processedAsImages: true,

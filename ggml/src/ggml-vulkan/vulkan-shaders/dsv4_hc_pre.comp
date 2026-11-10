@@ -17,6 +17,9 @@ layout(push_constant) uniform Parameters {
     uint sx0, sx1, sx2;
     uint sw0, sw1;
     uint sd0, sd1;
+    uint gated;   // strix-port (upstream #28988): w is a per-element gate [n_embd, hc, n_tokens], applied as sigmoid
+    uint sw2;
+    float scale;
 } p;
 
 void main() {
@@ -28,10 +31,18 @@ void main() {
     const uint i0 = ir % p.n_embd;
     const uint it = ir / p.n_embd;
 
-    float sum = data_x[i0 * p.sx0 + it * p.sx2] * data_w[it * p.sw1];
-    for (uint ih = 1; ih < p.hc; ++ih) {
-        sum += data_x[i0 * p.sx0 + ih * p.sx1 + it * p.sx2] * data_w[ih * p.sw0 + it * p.sw1];
+    float sum = 0.0f;
+    if (p.gated != 0) {
+        for (uint ih = 0; ih < p.hc; ++ih) {
+            const float g = 1.0f / (1.0f + exp(-data_w[i0 * p.sw0 + ih * p.sw1 + it * p.sw2]));
+            sum += data_x[i0 * p.sx0 + ih * p.sx1 + it * p.sx2] * g;
+        }
+    } else {
+        sum = data_x[i0 * p.sx0 + it * p.sx2] * data_w[it * p.sw1];
+        for (uint ih = 1; ih < p.hc; ++ih) {
+            sum += data_x[i0 * p.sx0 + ih * p.sx1 + it * p.sx2] * data_w[ih * p.sw0 + it * p.sw1];
+        }
     }
 
-    data_d[i0 * p.sd0 + it * p.sd1] = sum;
+    data_d[i0 * p.sd0 + it * p.sd1] = p.scale * sum;
 }

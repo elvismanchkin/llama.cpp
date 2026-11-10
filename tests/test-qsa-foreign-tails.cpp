@@ -4,7 +4,7 @@
 // filling their tail lists must skip the image cells instead of asserting on their shared slot.
 // Runs the production scan on host tensors, without model weights or a device.
 
-#include "../src/llama-memory-hybrid-idx.h"
+#include "../src/llama-memory-hybrid-qsa.h"
 #include "../src/llama-model.h"
 #include "../src/llama-batch.h"
 
@@ -39,7 +39,7 @@ struct qsa_ubatch {
 int main() {
     std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN4EXP, llama_model_default_params()));
     model->hparams = {};
-    llama_memory_hybrid_idx mem(*model, GGML_TYPE_F16, GGML_TYPE_F16, false, 64, 1, 0, LLAMA_SWA_TYPE_NONE,
+    llama_memory_hybrid_qsa mem(*model, /*no_alloc*/ false, GGML_TYPE_F16, GGML_TYPE_F16, false, 64, 0, LLAMA_SWA_TYPE_NONE,
                                 GGML_TYPE_F32, GGML_TYPE_F32, 4, 3, 0, false, true,
                                 nullptr, nullptr, [](int32_t) { return false; });
     GGML_ASSERT(mem.get_mem_idx() != nullptr);

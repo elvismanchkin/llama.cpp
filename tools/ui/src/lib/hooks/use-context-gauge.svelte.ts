@@ -5,10 +5,15 @@
  */
 
 import { useProcessingState } from './use-processing-state.svelte';
-import { colorLevelFromPercent } from '$lib/components/app/chat/ChatForm/ChatFormContextGauge/context-gauge';
+import { page } from '$app/state';
+import {
+	colorLevelFromPercent,
+	hasProcessedTokens
+} from '$lib/components/app/chat/ChatForm/ChatFormContextGauge/context-gauge';
 import { STATS_UNITS } from '$lib/constants';
 import { ColorLevel } from '$lib/enums';
-import { contextStatsStore, modelsStore } from '$lib/stores';
+import { chatStore, contextStatsStore, conversationsStore, modelsStore } from '$lib/stores';
+import type { DatabaseMessage } from '$lib/types';
 
 export interface UseContextGaugeReturn {
 	readonly activeModelId: string | null;
@@ -46,6 +51,23 @@ function filterTransientDetails(raw: string[]): string[] {
 	});
 }
 
+/** Whether the open conversation has spent any tokens yet, which is when the gauge shows. */
+export function useShowContextGauge(): { readonly current: boolean } {
+	const show = $derived(
+		Boolean(page.params.id) &&
+			hasProcessedTokens(
+				conversationsStore.activeMessages as DatabaseMessage[],
+				chatStore.isLoading || chatStore.isStreaming() ? chatStore.processing.activeState : null
+			)
+	);
+
+	return {
+		get current() {
+			return show;
+		}
+	};
+}
+
 export function useContextGauge(): UseContextGaugeReturn {
 	const processingState = useProcessingState();
 
@@ -54,10 +76,10 @@ export function useContextGauge(): UseContextGaugeReturn {
 		const modelId = contextStatsStore.activeModelId;
 
 		if (modelId && contextStatsStore.isActiveModelLoaded) {
-			const cached = modelsStore.getModelProps(modelId);
+			const cached = modelsStore.props.getModelProps(modelId);
 
 			if (!cached) {
-				void modelsStore.fetchModelProps(modelId);
+				void modelsStore.props.fetchModelProps(modelId);
 			}
 		}
 	});
@@ -80,9 +102,9 @@ export function useContextGauge(): UseContextGaugeReturn {
 		if (!modelId || contextStatsStore.isActiveModelLoading) return;
 
 		try {
-			await modelsStore.loadModel(modelId);
+			await modelsStore.status.load(modelId);
 		} catch {
-			// toast already surfaced by modelsStore.loadModel
+			// toast already surfaced by modelsStore.status.load
 		}
 	}
 

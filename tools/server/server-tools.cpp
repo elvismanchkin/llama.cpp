@@ -8,7 +8,6 @@
 #include <regex>
 #include <thread>
 #include <chrono>
-#include <ctime>
 #include <atomic>
 #include <cstring>
 #include <cctype>
@@ -40,9 +39,25 @@ namespace fs = std::filesystem;
 // internal helpers
 //
 
-// a child process writes in the OEM code page, so accented output would reach
-// the JSON layer as invalid bytes. run() spawns without a console, so the
-// console code page never applies
+#if defined(_WIN32)
+// code page of the system locale, read once at first use
+static UINT legacy_oem_code_page() {
+    static const UINT cp = [] {
+        DWORD value = 0;
+        const int ret = GetLocaleInfoEx(LOCALE_NAME_SYSTEM_DEFAULT, LOCALE_IDEFAULTCODEPAGE | LOCALE_RETURN_NUMBER,
+                                        reinterpret_cast<LPWSTR>(&value), sizeof(value) / sizeof(WCHAR));
+        if (ret > 0 && value && value != CP_OEMCP) {
+            return static_cast<UINT>(value);
+        }
+        return GetOEMCP();
+    }();
+    return cp;
+}
+#endif
+
+// a child process writes in the legacy console code page, so accented output would reach
+// the JSON layer as invalid bytes. run() spawns without a console, so the console
+// code page never applies
 static std::string console_output_to_utf8(const std::string & text) {
 #if defined(_WIN32)
     // a chunk can end mid sequence, so the incomplete tail is dropped first
@@ -51,7 +66,7 @@ static std::string console_output_to_utf8(const std::string & text) {
         return text;
     }
 
-    const UINT cp = GetOEMCP();
+    const UINT cp = legacy_oem_code_page();
 
     // fail rather than emit replacement characters when the code page is wrong
     const int wide_len = MultiByteToWideChar(cp, MB_ERR_INVALID_CHARS, text.data(), (int) text.size(), nullptr, 0);
@@ -97,29 +112,14 @@ enum class list_kind {
     all,   // both
 };
 
-// a narrow path uses the active code page on Windows, so every crossing between
-// a std::string (always UTF-8 here) and fs::path is converted explicitly
-static fs::path path_from_utf8(const std::string & s) {
-    return fs::u8path(s);
-}
-
-// '/' separators on every platform: Windows accepts them, the web UI needs them
-static std::string path_to_utf8(const fs::path & p) {
-    const auto s = p.generic_u8string();
-    return std::string(s.begin(), s.end());
-}
-
 // home directory, read once at first use (getenv is not thread safe against setenv)
 static const std::string & home_dir() {
     static const std::string home = [] {
 #ifdef _WIN32
-        // the narrow getenv would return the profile path in the active code page
-        const wchar_t * w = _wgetenv(L"HOME");
-        if (w == nullptr) w = _wgetenv(L"USERPROFILE");
-        return w ? path_to_utf8(fs::path(w)) : std::string();
+        const std::string h = common_get_env("HOME");
+        return h.empty() ? common_get_env("USERPROFILE") : h;
 #else
-        const char * h = getenv("HOME");
-        return h ? std::string(h) : std::string();
+        return common_get_env("HOME");
 #endif
     }();
     return home;
@@ -306,7 +306,7 @@ public:
     std::string resolve(const std::string & path) const override {
         const std::string p = expand_home(path);
 
-        fs::path full = path_from_utf8(p);
+        fs::path full = p;
         if (!full.is_absolute()) {
             if (cwd.empty()) {
                 std::error_code ec;
@@ -314,7 +314,7 @@ public:
                 if (ec) return p;
                 full = cur / full;
             } else {
-                full = path_from_utf8(cwd) / full;
+                full = fs::path(cwd) / full;
             }
         }
 
@@ -324,27 +324,27 @@ public:
         if (!full.has_filename() && full != full.root_path()) {
             full = full.parent_path();
         }
-        return path_to_utf8(full);
+        return full.generic_string();
     }
 
     bool is_directory(const std::string & path) const override {
         std::error_code ec;
-        return fs::is_directory(path_from_utf8(resolve(path)), ec) && !ec;
+        return fs::is_directory(resolve(path), ec) && !ec;
     }
 
     bool is_regular_file(const std::string & path) const override {
         std::error_code ec;
-        return fs::is_regular_file(path_from_utf8(resolve(path)), ec) && !ec;
+        return fs::is_regular_file(resolve(path), ec) && !ec;
     }
 
     bool file_size(const std::string & path, uintmax_t & out_size) const override {
         std::error_code ec;
-        out_size = fs::file_size(path_from_utf8(resolve(path)), ec);
+        out_size = fs::file_size(resolve(path), ec);
         return !ec;
     }
 
     bool read_file(const std::string & path, std::string & out) const override {
-        std::ifstream f(path_from_utf8(resolve(path)), std::ios::binary);
+        std::ifstream f(resolve(path), std::ios::binary);
         if (!f) return false;
         std::ostringstream ss;
         ss << f.rdbuf();
@@ -354,7 +354,7 @@ public:
 
     bool write_file(const std::string & path, const std::string & content) const override {
         std::error_code ec;
-        fs::path fpath = path_from_utf8(resolve(path));
+        fs::path fpath = resolve(path);
         if (fpath.has_parent_path()) {
             fs::create_directories(fpath.parent_path(), ec);
             if (ec) return false;
@@ -390,7 +390,7 @@ public:
                     if (line.empty()) continue;
                     std::replace(line.begin(), line.end(), '\\', '/');
                     if (max_depth > 0 && entry_depth(line) > max_depth) continue;
-                    if (is_regular_file(path_to_utf8(path_from_utf8(base) / path_from_utf8(line)))) {
+                    if (is_regular_file((fs::path(base) / line).generic_string())) {
                         out.entries.push_back({line, false});
                     }
                 }
@@ -460,7 +460,7 @@ private:
         std::vector<list_entry> result;
 
         std::vector<std::tuple<fs::path, fs::path, int>> stack;
-        stack.emplace_back(path_from_utf8(base), fs::path(), 0);
+        stack.emplace_back(base, fs::path(), 0);
 
         while (!stack.empty()) {
             if (std::chrono::steady_clock::now() >= deadline) {
@@ -495,16 +495,16 @@ private:
                 if (tec) continue;
                 if (is_dir) {
                     if (kind == list_kind::dirs || kind == list_kind::all) {
-                        result.push_back({path_to_utf8(rel_dir / fname), true});
+                        result.push_back({(rel_dir / fname).generic_string(), true});
                     }
                     // junk directories stay selectable but are never walked: they can be enormous
-                    if (junk_dir_names().count(get_effective_name(path_to_utf8(fname))) > 0) continue;
+                    if (junk_dir_names().count(get_effective_name(fname.generic_string())) > 0) continue;
                     if (!is_link(entry) && (max_depth == 0 || depth + 1 < max_depth)) {
                         stack.emplace_back(entry.path(), rel_dir / fname, depth + 1);
                     }
                 } else if (entry.is_regular_file(tec)) {
                     if (kind == list_kind::files || kind == list_kind::all) {
-                        result.push_back({path_to_utf8(rel_dir / fname), false});
+                        result.push_back({(rel_dir / fname).generic_string(), false});
                     }
                 }
             }
@@ -852,7 +852,7 @@ static std::unique_ptr<tools_io> make_tools_io(const json & params) {
 // no '/' in pattern -> match basename at any depth; else match full relative path
 static bool path_glob_match(const std::string & pattern, const std::string & rel_path) {
     if (pattern.find('/') == std::string::npos) {
-        return glob_match(pattern, path_to_utf8(path_from_utf8(rel_path).filename()));
+        return glob_match(pattern, fs::path(rel_path).filename().generic_string());
     }
     if (pattern == "**" || pattern.rfind("**/", 0) == 0 || pattern.rfind('/', 0) == 0) {
         return glob_match(pattern, rel_path);
@@ -1175,7 +1175,7 @@ struct server_tool_grep_search : server_tool {
             for (const auto & entry : listing.entries) {
                 if (!path_glob_match(include, entry.rel)) continue;
                 if (!exclude.empty() && path_glob_match(exclude, entry.rel)) continue;
-                files.emplace_back(path_to_utf8(path_from_utf8(abs_path) / path_from_utf8(entry.rel)), entry.rel);
+                files.emplace_back((fs::path(abs_path) / entry.rel).generic_string(), entry.rel);
             }
         } else {
             return {{"error", "path does not exist: " + path}};
@@ -1693,61 +1693,6 @@ private:
 };
 
 //
-// get_datetime: returns the current date and time
-//
-
-struct server_tool_get_datetime : server_tool {
-    server_tool_get_datetime() {
-        name = "get_datetime";
-        display_name = "Get Date & Time";
-        permission_write = false;
-    }
-
-    json get_definition() const override {
-        return {
-            {"type", "function"},
-            {"function", {
-                {"name", name},
-                {"description", "Returns the current date and time in UTC"},
-                {"parameters", {
-                    {"type", "object"},
-                    {"properties", {
-                        {"format", {
-                            {"type", "string"},
-                            {"description",
-                                "strftime()-style format string for the output (default: \"%Y-%m-%dT%H:%M:%SZ\", "
-                                "e.g. ISO 8601). Choose your own format if you need something else, "
-                                "e.g. \"%A, %B %d %Y\" for a human-readable date."},
-                        }},
-                    }},
-                }},
-            }},
-        };
-    }
-
-    json invoke(json params, server_tool::stream *) const override {
-        std::string format = json_value(params, "format", std::string("%Y-%m-%dT%H:%M:%SZ"));
-
-        auto now  = std::chrono::system_clock::now();
-        auto time = std::chrono::system_clock::to_time_t(now);
-        std::tm tm_utc;
-#ifdef _WIN32
-        gmtime_s(&tm_utc, &time);
-#else
-        gmtime_r(&time, &tm_utc);
-#endif
-
-        char buf[256];
-        size_t len = std::strftime(buf, sizeof(buf), format.c_str(), &tm_utc);
-        if (len == 0) {
-            return {{"error", "invalid format string"}};
-        }
-
-        return {{"result", std::string(buf, len)}};
-    }
-};
-
-//
 // get_info: returns runtime info (OS name/version and cwd)
 //
 
@@ -1797,7 +1742,7 @@ struct server_tool_get_info : server_tool {
         if (cwd.empty()) {
             if (json_value(params, "runtime", std::string()).empty()) {
                 std::error_code ec;
-                cwd = path_to_utf8(fs::current_path(ec));
+                cwd = fs::current_path(ec).generic_string();
             } else {
                 auto pwd = io->run({"pwd"}, SERVER_TOOL_GET_INFO_MAX_OUTPUT, SERVER_TOOL_GET_INFO_TIMEOUT);
                 cwd = pwd.exit_code == 0 && !pwd.timed_out ? string_strip(pwd.output) : "unknown";
@@ -1965,7 +1910,7 @@ private:
             "llama-tools-runtime-cid-%zu.tmp", std::hash<std::thread::id>{}(std::this_thread::get_id()));
         fs::remove(cidfile, ec);
 
-        std::vector<std::string> args = {bin, "run", "--rm", "-i", "--cidfile", path_to_utf8(cidfile), image, "sh"};
+        std::vector<std::string> args = {bin, "run", "--rm", "-i", "--cidfile", cidfile.generic_string(), image, "sh"};
         int options = subprocess_option_no_window
                     | subprocess_option_inherit_environment
                     | subprocess_option_search_user_path;
@@ -2005,6 +1950,10 @@ static server_tool & find_tool(std::vector<std::unique_ptr<server_tool>> & tools
 //
 
 static std::vector<std::unique_ptr<server_tool>> build_tools() {
+    // IMPORTANT: for contributors, please keep this array of tools as minimal as possible
+    //            we only accept minimal i/o and shell command tools here
+    //            for example, do not add: web search, get date time, etc.
+    //            high-level functionality should be added either via MCP or web UI
     std::vector<std::unique_ptr<server_tool>> tools;
     tools.push_back(std::make_unique<server_tool_read_file>());
     tools.push_back(std::make_unique<server_tool_file_glob_search>());
@@ -2012,7 +1961,6 @@ static std::vector<std::unique_ptr<server_tool>> build_tools() {
     tools.push_back(std::make_unique<server_tool_exec_shell_command>());
     tools.push_back(std::make_unique<server_tool_write_file>());
     tools.push_back(std::make_unique<server_tool_edit_file>());
-    tools.push_back(std::make_unique<server_tool_get_datetime>());
     tools.push_back(std::make_unique<server_tool_get_info>());
     return tools;
 }
@@ -2088,7 +2036,7 @@ void server_tools::setup(const std::vector<std::string> & enabled_tools,
         }
     }
 
-    // append MCP tools, skipping any that collide with a built-in or another MCP tool of the same "<server>_<tool>" name
+    // append MCP tools, skipping any that collide with a server tool or another MCP tool of the same "<server>_<tool>" name
     if (!mcp_mgr.empty()) {
         std::unordered_set<std::string> seen_names;
         for (auto & t : tools) {
@@ -2209,7 +2157,7 @@ void server_tools::setup(const std::vector<std::string> & enabled_tools,
                 res->status = 200;
                 res->data   = safe_json_to_str(result);
             }
-        } catch (const json::exception & e) {
+        } catch (const common_json_error & e) {
             res->status = 400;
             res->data   = safe_json_to_str(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
         } catch (const std::invalid_argument & e) {

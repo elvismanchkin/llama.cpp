@@ -8,7 +8,7 @@
 #include <numeric>
 #include "models.h"
 #include "llama-impl.h"
-#include "llama-memory-hybrid-idx.h"
+#include "llama-memory-hybrid-qsa.h"
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
@@ -63,7 +63,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     }
     GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < block_count");
 
-    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
+    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
 
@@ -262,7 +262,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         const bool is_mtp_layer = il >= (int) n_layer_main;
         const int  flags        = is_mtp_layer ? mtp_flags : trunk_flags;
 
-        const int64_t n_ff_exp   = hparams.n_ff_exp   ? hparams.n_ff_exp   : n_ff / n_expert_used;
+        const int64_t n_ff_exp   = hparams.n_ff_exp(il) ? hparams.n_ff_exp(il) : n_ff / n_expert_used;
         const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
 
         const int64_t head_k_dim = hparams.ssm_d_state;
@@ -1201,9 +1201,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
     auto * inp = build_inp_mem_hybrid();
 
-    // qwen4exp always builds llama_memory_hybrid_idx, so this downcast is safe
+    // qwen4exp always builds llama_memory_hybrid_qsa, so this downcast is safe
     // the indexer cache inside it is absent when the GGUF has no indexer tensors
-    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp->mctx);
+    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_qsa_context *>(inp->mctx);
 
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
     if (mctx_idx) {
@@ -1408,7 +1408,7 @@ static bool qwen4exp_qsa_dense_shortcut() {
 // append the query's own partial block as the tail (up to ratio-1 cells), -1 where nothing is visible. The
 // selected rows then carry the visibility themselves, so attention runs without a mask. Only the selected-key
 // attention kernels understand that layout (head 256, single stream), so the selection needs selected_key_attn:
-// every QSA layer's device took the probe op with the cache's K/V types (llama_memory_hybrid_idx). The selection
+// every QSA layer's device took the probe op with the cache's K/V types (llama_memory_hybrid_qsa). The selection
 // carries cells through f32, hence the 2^24 bound on n_kv.
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t n_stream, int64_t ratio, int64_t n_kv,
         const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams,
@@ -1423,7 +1423,7 @@ static bool qwen4exp_use_block_selection(bool blk_bias, int64_t n_stream, int64_
 // the selection decision for one ratio: the gate above, no SWA, and a cache whose visibility the selection
 // encodes exactly (qsa_scalar_visibility: one-axis positions, no block split over sequence sets). Elsewhere the
 // masked block-expanded top-k runs, whose set_rows would write row -1 for the selection's sentinels.
-static bool qwen4exp_block_selection(const llama_memory_hybrid_idx_context * mctx, bool blk_bias, int64_t n_stream,
+static bool qwen4exp_block_selection(const llama_memory_hybrid_qsa_context * mctx, bool blk_bias, int64_t n_stream,
         int64_t ratio, int64_t n_kv, const llama_ubatch & ubatch, const llama_cparams & cparams,
         const llama_hparams & hparams) {
     const auto * attn = mctx->get_attn();
@@ -1496,7 +1496,7 @@ static ggml_tensor * qwen4exp_select_complete_blocks(ggml_context * ctx0, ggml_t
 // mean-pooled indexer key, plus the incomplete tail. set_input resolves the cache layout.
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
 public:
-    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias, uint32_t top_k,
+    llm_graph_input_qsa(const llama_memory_hybrid_qsa_context * mctx, uint32_t ratio, bool blk_bias, uint32_t top_k,
             bool shortcut, bool maskless) :
         mctx(mctx), ratio(ratio), top_k(top_k), shortcut(shortcut), maskless(maskless), blk_bias(blk_bias) {}
     virtual ~llm_graph_input_qsa() = default;
@@ -1533,7 +1533,7 @@ public:
     // split at its start, so every tile's rows stayed resident next to the whole mask. Set by build_qsa_top_k.
     ggml_tensor * rows       = nullptr;  // I32 [n_tokens]
 
-    const llama_memory_hybrid_idx_context * mctx;
+    const llama_memory_hybrid_qsa_context * mctx;
     const uint32_t ratio;
     const uint32_t top_k;
     const bool     shortcut;   // built without cell_blk / bias: the dense shortcut was taken
@@ -1553,7 +1553,7 @@ public:
 // context. n_kv is padded, so this holds between padding steps. set_input still runs on the reuse
 // path, so only topology is certified here.
 bool llama_model_qwen4exp::llm_graph_input_qsa::can_reuse(const llm_graph_params & params) {
-    const auto * m = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+    const auto * m = static_cast<const llama_memory_hybrid_qsa_context *>(params.mctx);
 
     this->mctx = m;
 
@@ -1611,7 +1611,7 @@ bool llama_model_qwen4exp::llm_graph_input_qsa::can_reuse(const llm_graph_params
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
-        const llama_memory_hybrid_idx_context * mctx_hyb,
+        const llama_memory_hybrid_qsa_context * mctx_hyb,
         ggml_tensor *                           cur,
         ggml_tensor *                           inp_pos,
         ggml_tensor *                           kq_mask,
@@ -1991,13 +1991,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         int                       il) {
     // rotate q/k/v before they reach a quantized cache, as the dense path does. the indexer
     // has already scored with its own query in build_qsa_top_k, so top_k is unaffected.
-    if (inp->self_k_rot) {
-        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
-        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+    if (inp->self_k_rot[il]) {
+        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot[il]);
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot[il]);
     }
 
-    if (inp->self_v_rot) {
-        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+    if (inp->self_v_rot[il]) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot[il]);
     }
 
     // these nodes are added to the graph together so that they are not reordered
@@ -2024,15 +2024,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     if (shared_qsa != qsa_inps.end() && shared_qsa->second->maskless) {
         ggml_tensor * k = mctx_cur->get_k(ctx0, il);
         ggml_tensor * v = mctx_cur->get_v(ctx0, il);
-        ggml_tensor * cur = build_attn_mha(q_cur, k, v, nullptr, nullptr, nullptr, nullptr, kq_scale, il, top_k, 0);
+        ggml_tensor * cur = build_attn_mha(q_cur, k, v, nullptr, nullptr, nullptr, nullptr, nullptr, 0, kq_scale, il, top_k, 0);
         cb(cur, "kqv_out", il);
-        if (inp->self_v_rot) {
-            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+        if (inp->self_v_rot[il]) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot[il]);
         }
         return cur;
     }
 
-    ggml_tensor * kq_mask = inp->get_kq_mask();
+    ggml_tensor * kq_mask = inp->self_attn_mask.raw;
 
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
@@ -2089,7 +2089,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         // gather-compact path) costs O(n_top_k) instead. n_kv_raw is 0: unlike DeepSeek V4 this
         // cache has no dense prefix, every attended cell comes from the selection. Backends without
         // that path ignore the extra argument and read the same mask they do today.
-        return build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il, sel, 0);
+        return build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, nullptr, 0, kq_scale, il, sel, 0);
     };
 
     // The rebuilt mask is n_kv x rows (2 B per cell and query for flash attention's f16, three of them), and
@@ -2141,8 +2141,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
-    if (inp->self_v_rot) {
-        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+    if (inp->self_v_rot[il]) {
+        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot[il]);
     }
 
     return cur;
@@ -2211,7 +2211,7 @@ struct llm_graph_input_qwen4exp_tile : public llm_graph_input_i {
 
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         llm_graph_input_attn_kv * inp,
-        const llama_memory_hybrid_idx_context * mctx_hyb,
+        const llama_memory_hybrid_qsa_context * mctx_hyb,
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
         int *                     sections,
@@ -2249,7 +2249,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
                         __func__, il, q_first, (int64_t) n_tokens, (int64_t) n_tokens);
             }
         }
-        top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il, trim ? q_first : 0, q_pos);
+        top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->self_attn_mask.raw, sections, il, trim ? q_first : 0, q_pos);
     }
     const int64_t n_q   = trim ? n_tokens - q_first : n_tokens;
     ggml_tensor * cur_q = trim ? ggml_view_2d(ctx0, cur, cur->ne[0], n_q, cur->nb[1], q_first*cur->nb[1]) : cur;
@@ -2678,7 +2678,7 @@ static bool ple_host_gather() {
 // Topology is fixed by the token count alone: table, head count and hash constants never
 // change. set_input still refreshes the values on the reuse path.
 bool llm_graph_input_ple::can_reuse(const llm_graph_params & params) {
-    const auto * m = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+    const auto * m = static_cast<const llama_memory_hybrid_qsa_context *>(params.mctx);
 
     // set_input reads the predecessor tokens out of the attention cells through this pointer, and
     // the memory context is rebuilt for every decode. A reused graph keeps the input object alive
@@ -3172,7 +3172,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
 ggml_tensor * llama_model_qwen4exp::graph::build_ple(
         llm_graph_input_rs * inp,
-        const llama_memory_hybrid_idx_context * mctx_hyb,
+        const llama_memory_hybrid_qsa_context * mctx_hyb,
         ggml_tensor *        hidden,
         int                  il) {
     GGML_UNUSED(inp);
@@ -3361,7 +3361,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    auto inp_h = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_out());
+    auto inp_h = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_out(), hparams.n_embd_out());
 
     inp_h->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp_h->tokens);
@@ -3369,9 +3369,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     inp_h->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
     ggml_set_input(inp_h->embd);
 
-    inp_h->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
-    ggml_set_input(inp_h->h);
-    ggml_set_name(inp_h->h, "mtp_h_input");
+    // merge: the trunk state arrives through upstream's state input (host rows or the h_nextn device buffer)
+    inp_h->h = build_inp_embd_state(inp_h.get(), hparams.n_embd_out());
 
     ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
     if (tok_embd_w == nullptr) {
@@ -3402,7 +3401,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // the MTP context holds a plain attention cache over the nextn layer(s) only, the
     // deepseek32 pattern: the draft runs dense (no indexer cache, no recurrent state)
     auto * inp_attn = build_attn_inp_kv();
-    const llama_memory_hybrid_idx_context * mctx_hyb = nullptr;
+    const llama_memory_hybrid_qsa_context * mctx_hyb = nullptr;
 
     // hnorm is the same grouped RMSNorm as every HC norm: rms over one stream, flat gamma
     ggml_tensor * h_norm = ggml_rms_norm(ctx0, h_state, hparams.f_norm_rms_eps);
@@ -3464,11 +3463,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
                 );
         cb(Kcur, "Kcur", il);
 
-        if (inp_attn->self_k_rot) {
-            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot);
+        if (inp_attn->self_k_rot[il]) {
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot[il]);
         }
-        if (inp_attn->self_v_rot) {
-            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
+        if (inp_attn->self_v_rot[il]) {
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot[il]);
         }
 
         ggml_build_forward_expand(gf, Vcur);

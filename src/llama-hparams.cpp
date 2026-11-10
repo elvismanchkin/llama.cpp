@@ -71,6 +71,31 @@ uint32_t llama_hparams::n_ff(uint32_t il) const {
     GGML_ABORT("fatal error");
 }
 
+uint32_t llama_hparams::n_ff_exp(uint32_t il) const {
+    if (il < n_layer_all) {
+        return n_ff_exp_arr[il];
+    }
+
+    GGML_ABORT("fatal error");
+}
+
+uint32_t llama_hparams::n_expert_used(uint32_t il) const {
+    if (il < n_layer_all) {
+        return n_expert_used_arr[il];
+    }
+
+    GGML_ABORT("fatal error");
+}
+
+uint32_t llama_hparams::n_expert_used_max() const {
+    uint32_t val = 0;
+    for (uint32_t il = 0; il < n_layer_all; ++il) {
+        val = std::max(val, n_expert_used(il));
+    }
+
+    return val;
+}
+
 uint32_t llama_hparams::n_gqa(uint32_t il) const {
     const uint32_t n_head    = this->n_head(il);
     const uint32_t n_head_kv = this->n_head_kv(il);
@@ -203,10 +228,8 @@ uint32_t llama_hparams::n_embd_r() const {
     // Corresponds to Mamba's conv_states size
     const uint32_t n_conv = (ssm_d_conv > 0 ? ssm_d_conv - 1 : 0) * (ssm_d_inner + 2*ssm_n_group*ssm_d_state);
 
-    // qwen4exp's PLE dilated conv history deliberately does not share this row: the Meta backend
-    // splits cache_r_l by head and cannot view one sub-range of a split axis, so a second history
-    // packed behind the first is unaddressable under -sm tensor. it lives in cache_ple_r_l instead,
-    // mirrored, because the whole PLE module is mirrored
+    // PLE conv history needs its own row: Meta splits cache_r_l by head, so a history packed behind the first is unaddressable
+    // it lives in cache_ple_r_l instead, mirrored like the rest of the PLE module
     return n_conv;
 }
 
@@ -260,7 +283,8 @@ bool llama_hparams::is_ple(uint32_t il) const {
 }
 
 uint32_t llama_hparams::n_pos_per_embd() const {
-    return rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE ? 4 : 1;
+    return (rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE)
+            ? GGML_MROPE_SECTIONS : 1;
 }
 
 bool llama_hparams::is_swa(uint32_t il) const {
@@ -295,16 +319,15 @@ uint32_t llama_hparams::n_embd_head_v_mla() const {
 }
 
 bool llama_hparams::has_kv(uint32_t il) const {
-    if (n_layer_kv_from_start >= 0) {
-        if (il < (uint32_t) n_layer_kv_from_start) {
-            return true;
-        }
+    return kv_source(il) == il;
+}
 
-        return false;
+uint32_t llama_hparams::kv_source(uint32_t il) const {
+    if (il < n_layer_all) {
+        return kv_source_impl[il];
     }
 
-    // by default, all layers have kv
-    return true;
+    GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
 }
 
 bool llama_hparams::has_rope(uint32_t il) const {
@@ -314,7 +337,11 @@ bool llama_hparams::has_rope(uint32_t il) const {
         return false;
     }
 
-    return true;
+    if (il < n_layer_all) {
+        return rope_pattern[il] != 0;
+    }
+
+    GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
 }
 
 uint32_t llama_hparams::n_layer() const {
