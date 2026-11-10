@@ -34,26 +34,43 @@ layout (binding = 2) writeonly buffer DST {float data_dst[];};
 layout (binding = 2) writeonly buffer DST16 {uint16_t data_dst16[];};
 
 shared uint vals[BLOCK_SIZE];
+shared uint negs[BLOCK_SIZE];
+shared uint skipped[BLOCK_SIZE];
 
-// zero the dst rows of the skipped slots (negative ids); the workgroups split the slots between them
+// zero the dst rows of the skipped slots (negative ids). The workgroups split the slots in chunks of BLOCK_SIZE, each
+// thread checks one slot id of the chunk, then the whole workgroup zeroes each skipped row of the chunk.
+// Called in workgroup-uniform control flow only (barriers)
 void zero_skipped_rows() {
     const uint num_elements = p.ne00 * p.ne01;
-    for (uint idx = gl_WorkGroupID.x; idx < num_elements; idx += gl_NumWorkGroups.x) {
-        const uint i01 = idx / p.ne00;
-        const uint i00 = idx % p.ne00;
-        if (int(data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00]) >= 0) {
-            continue;
+    const uint tid = gl_LocalInvocationID.x;
+    for (uint base = gl_WorkGroupID.x * BLOCK_SIZE; base < num_elements; base += gl_NumWorkGroups.x * BLOCK_SIZE) {
+        const uint idx = base + tid;
+        uint skip = 0;
+        if (idx < num_elements) {
+            const uint i01 = idx / p.ne00;
+            const uint i00 = idx % p.ne00;
+            skip = uint(int(data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00]) < 0);
         }
-        const uint d_off = i00 * p.stride_dst + i01 * p.batch_stride_dst;
-        if (p.dst_f16 != 0) {
-            for (uint i = gl_LocalInvocationID.x; i < p.ne0_dst; i += BLOCK_SIZE) {
-                data_dst16[d_off + i] = uint16_t(0);
+        skipped[tid] = skip;
+        barrier();
+        for (uint j = 0; j < BLOCK_SIZE; j++) {
+            if (skipped[j] == 0) {
+                continue;
             }
-        } else {
-            for (uint i = gl_LocalInvocationID.x; i < p.ne0_dst; i += BLOCK_SIZE) {
-                data_dst[d_off + i] = 0.0;
+            const uint i01 = (base + j) / p.ne00;
+            const uint i00 = (base + j) % p.ne00;
+            const uint d_off = i00 * p.stride_dst + i01 * p.batch_stride_dst;
+            if (p.dst_f16 != 0) {
+                for (uint i = tid; i < p.ne0_dst; i += BLOCK_SIZE) {
+                    data_dst16[d_off + i] = uint16_t(0);
+                }
+            } else {
+                for (uint i = tid; i < p.ne0_dst; i += BLOCK_SIZE) {
+                    data_dst[d_off + i] = 0.0;
+                }
             }
         }
+        barrier();
     }
 }
 
@@ -63,19 +80,24 @@ void main() {
     const uint tid = gl_LocalInvocationID.x;
 
     uint count = 0;
+    uint neg = 0;
     for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
         const uint i01 = idx / p.ne00;
         const uint i00 = idx % p.ne00;
         const uint a = data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00];
 
         count += uint(a == expert_id);
+        neg |= uint(int(a) < 0);
     }
 
+    // each workgroup reads every id, so each one learns whether any slot is skipped
     vals[tid] = count;
+    negs[tid] = neg;
     barrier();
     [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
         if (tid < s) {
             vals[tid] += vals[tid + s];
+            negs[tid] |= negs[tid + s];
         }
         barrier();
     }
@@ -91,7 +113,7 @@ void main() {
         }
     }
 
-    if (p.ne0_dst != 0) {
+    if (p.ne0_dst != 0 && negs[0] != 0) {
         zero_skipped_rows();
     }
 }
